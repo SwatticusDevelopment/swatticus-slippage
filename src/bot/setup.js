@@ -15,6 +15,7 @@ const {
 	checkArbitrageOpportunity
 } = require("../utils/jupiterApiClient");
 const logger = require("../utils/logger");
+const axios = require('axios');
 
 const wrapUnwrapSOL = cache.wrapUnwrapSOL;
 
@@ -49,6 +50,64 @@ const tryMultipleRPCs = async (operation, rpcs, maxRetries = 3) => {
 	}
 	
 	throw new Error(`All RPC endpoints failed after ${maxRetries} attempts each`);
+};
+
+// REAL JUPITER SWAP EXECUTION FUNCTION
+const executeJupiterSwap = async (quote, wallet, connection) => {
+	try {
+		logger.info('🔥 EXECUTING REAL JUPITER SWAP');
+		
+		// Get serialized transactions from Jupiter API
+		const response = await axios.post('https://quote-api.jup.ag/v6/swap', {
+			quoteResponse: quote,
+			userPublicKey: wallet.publicKey.toString(),
+			wrapAndUnwrapSol: true,
+			dynamicComputeUnitLimit: true,
+			prioritizationFeeLamports: cache.config.priority
+		});
+		
+		if (!response.data || !response.data.swapTransaction) {
+			throw new Error('Failed to get swap transaction from Jupiter');
+		}
+		
+		// Deserialize the transaction
+		const { Transaction } = require('@solana/web3.js');
+		const swapTransactionBuf = Buffer.from(response.data.swapTransaction, 'base64');
+		const transaction = Transaction.from(swapTransactionBuf);
+		
+		// Sign the transaction
+		transaction.sign(wallet);
+		
+		logger.info('📤 Sending transaction to blockchain...');
+		
+		// Send the signed transaction
+		const txid = await connection.sendRawTransaction(transaction.serialize(), {
+			skipPreflight: false,
+			maxRetries: 3
+		});
+		
+		logger.info(`✅ Transaction sent! TXID: ${txid}`);
+		
+		// Confirm the transaction
+		const confirmation = await connection.confirmTransaction(txid, 'confirmed');
+		
+		if (confirmation.value.err) {
+			throw new Error(`Transaction failed: ${confirmation.value.err}`);
+		}
+		
+		logger.info(`🎉 TRADE EXECUTED SUCCESSFULLY! TXID: ${txid}`);
+		
+		return {
+			txid,
+			inputAmount: quote.inAmount,
+			outputAmount: quote.outAmount,
+			success: true
+		};
+		
+	} catch (error) {
+		logger.error('❌ Jupiter swap execution failed:', error);
+		throw error;
+	}
 };
 
 // Improved balance check with multiple RPC fallback
@@ -113,8 +172,7 @@ const checkTokenABalance = async (tokenObj, requiredAmount) => {
 		
 		if (realBalance < requiredAmount && realBalance > 0) {
 			logger.warn(`Insufficient balance: have ${toDecimal(realBalance, tokenObj.decimals)}, need ${toDecimal(requiredAmount, tokenObj.decimals)} ${tokenObj.symbol}`);
-			logger.warn('Continuing in simulation mode due to insufficient balance');
-			cache.tradingEnabled = false; // Force simulation mode
+			logger.warn('Continuing with available balance');
 		} else if (realBalance === 0) {
 			logger.warn('Zero balance detected - forcing simulation mode');
 			cache.tradingEnabled = false; // Force simulation mode
@@ -152,7 +210,7 @@ const setup = async () => {
 				throw new Error("Failed to create wallet from private key");
 			}
 
-			logger.info("Wallet initialized successfully");
+			logger.info("✅ Wallet initialized successfully");
 		} catch (walletError) {
 			logger.error(`Error creating wallet: ${walletError.message}`);
 			throw new Error("Invalid wallet private key format. Please check your .env file.");
@@ -228,7 +286,7 @@ const setup = async () => {
 					cache.tradingEnabled = false;
 				}
 			} else {
-				logger.info(`SOL balance: ${solBalance.toFixed(4)} SOL`);
+				logger.info(`💰 SOL balance: ${solBalance.toFixed(4)} SOL`);
 			}
 		} catch (balanceError) {
 			logger.warn(`Could not check wallet SOL balance: ${balanceError.message}`);
@@ -248,7 +306,7 @@ const setup = async () => {
 				testQuote = await getQuote(tokenA.address, tokenB.address, testAmount, 100);
 
 				if (testQuote) {
-					spinner.succeed(chalk.green("Jupiter API connection successful!"));
+					spinner.succeed(chalk.green("✅ Jupiter API connection successful!"));
 					break;
 				}
 			} catch (apiError) {
@@ -259,7 +317,7 @@ const setup = async () => {
 					logger.info(`Waiting ${delay}ms before retry...`);
 					await new Promise(resolve => setTimeout(resolve, delay));
 				} else {
-					spinner.fail(chalk.red("Jupiter API connection failed after all retries"));
+					spinner.fail(chalk.red("❌ Jupiter API connection failed after all retries"));
 					logger.error("Failed to connect to Jupiter API after multiple attempts");
 					
 					// Don't exit - continue in simulation mode
@@ -269,7 +327,14 @@ const setup = async () => {
 			}
 		}
 
-		// Create a real Jupiter interface with improved error handling
+		// Create RPC connection for trade execution
+		const primaryRpc = process.env.DEFAULT_RPC;
+		const rpcConnection = new Connection(primaryRpc, {
+			commitment: 'confirmed',
+			timeout: 30000
+		});
+
+		// Create a REAL Jupiter interface with ACTUAL trade execution
 		const jupiter = {
 			computeRoutes: async ({inputMint, outputMint, amount, slippageBps = 100}) => {
 				try {
@@ -278,13 +343,6 @@ const setup = async () => {
 					// Convert PublicKey to string
 					const inputMintStr = inputMint instanceof PublicKey ? inputMint.toString() : inputMint;
 					const outputMintStr = outputMint instanceof PublicKey ? outputMint.toString() : outputMint;
-
-					// Check if this is a same-token arbitrage
-					const isArbitrage = inputMintStr === outputMintStr;
-
-					if (isArbitrage) {
-						logger.debug("Same-token arbitrage detected - using intermediate USDC token for routing");
-					}
 
 					// Get quote from Jupiter API with retry logic
 					let quote = null;
@@ -329,18 +387,9 @@ const setup = async () => {
 							inAmount: step.swapInfo?.inAmount || step.inputAmount,
 							outAmount: step.swapInfo?.outAmount || step.outputAmount,
 							lpFee: {amount: '0'}
-						}))
+						})),
+						_fullQuote: quote // Store full quote for execution
 					};
-
-					// Calculate profit for arbitrage
-					if (isArbitrage) {
-						const inAmountBN = BigInt(quote.inAmount);
-						const outAmountBN = BigInt(quote.outAmount);
-						const profit = outAmountBN > inAmountBN ?
-							Number((outAmountBN - inAmountBN) * BigInt(10000) / inAmountBN) / 100 : 0;
-
-						logger.debug(`Arbitrage route found with profit: ${profit.toFixed(4)}%`);
-					}
 
 					return {routesInfos: [routeInfo]};
 				} catch (error) {
@@ -353,8 +402,7 @@ const setup = async () => {
 				return {
 					execute: async () => {
 						if (!cache.tradingEnabled) {
-							logger.info("Executing swap in simulation mode");
-							// Simulate a successful transaction
+							logger.info("💡 SIMULATION MODE - Trade would be executed");
 							return {
 								txid: "simulation_mode_txid",
 								inputAmount: routeInfo.inAmount,
@@ -362,20 +410,22 @@ const setup = async () => {
 								success: true
 							};
 						} else {
-							logger.warn("Real trading mode - implement actual swap execution here");
-							// In real implementation, this would call the actual swap API
-							// For now, just simulate
-							return {
-								txid: "simulation_mode_txid",
-								inputAmount: routeInfo.inAmount,
-								outputAmount: routeInfo.outAmount,
-								success: true
-							};
+							logger.info("🔥 REAL TRADING MODE - EXECUTING ACTUAL TRADE");
+							
+							// Execute real Jupiter swap
+							const fullQuote = routeInfo._fullQuote;
+							if (!fullQuote) {
+								throw new Error('Missing full quote data for trade execution');
+							}
+							
+							return await executeJupiterSwap(fullQuote, wallet, rpcConnection);
 						}
 					}
 				};
 			}
 		};
+
+		logger.info(`🚀 TRADING MODE: ${cache.tradingEnabled ? '🔥 LIVE TRADING' : '💡 SIMULATION'}`);
 
 		return {
 			jupiter,
@@ -536,4 +586,5 @@ module.exports = {
 	balanceCheck,
 	checkTokenABalance,
 	createTokenRotationFunction,
+	executeJupiterSwap
 };
